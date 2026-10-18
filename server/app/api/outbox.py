@@ -1,4 +1,4 @@
-"""POST /api/v1/outbox/claim и /api/v1/outbox/ack."""
+"""Эндпоинты очереди: POST /api/v1/outbox/claim и /api/v1/outbox/ack."""
 
 from fastapi import APIRouter, Depends, status
 
@@ -13,21 +13,11 @@ router = APIRouter(
 )
 
 
-@router.post(
-    "/claim",
-    response_model=OutboxClaimResponse,
-    summary="Забрать сообщения к доставке",
-)
+@router.post("/claim", response_model=OutboxClaimResponse, summary="Забрать сообщения")
 async def claim(service: OutboxServiceDep) -> OutboxClaimResponse:
-    """Создаёт напоминания по наступившим задачам и отдаёт пачку pending-записей."""
     return await service.claim()
 
 
-@router.post(
-    "/ack",
-    response_model=OutboxAckResponse,
-    summary="Подтвердить доставку",
-)
+@router.post("/ack", response_model=OutboxAckResponse, summary="Подтвердить доставку")
 async def ack(payload: OutboxAckRequest, service: OutboxServiceDep) -> OutboxAckResponse:
-    """Отмечает записи как sent или failed."""
     return await service.ack(payload)

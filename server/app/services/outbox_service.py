@@ -1,100 +1,116 @@
-"""Outbox: планирование напоминаний и выдача сообщений клиенту."""
+"""Очередь исходящих сообщений: напоминания и выдача клиенту (claim/ack)."""
 
-import logging
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.clock import Clock, utc_now
-from app.core.constants import OutboxKind
-from app.repositories import OutboxRepository, TaskRepository
-from app.schemas.outbox import OutboxAckRequest, OutboxItemOut
-from app.services import texts
+from app.core.config import Settings
+from app.core.constants import AckStatus, OutboxKind, OutboxStatus
+from app.db.models import OutboxMessage, Task, User, UserSettings
+from app.schemas.outbox import (
+    OutboxAckRequest,
+    OutboxAckResponse,
+    OutboxClaimResponse,
+    OutboxItemOut,
+)
 
-logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True, slots=True)
-class OutboxConfig:
-    """Параметры очереди из Settings."""
-
-    batch_size: int = 50
-    claim_timeout: timedelta = timedelta(seconds=60)
-    max_attempts: int = 5
+REMINDER_TEXT = "⏰ Напоминание: {title} (задача #{task_id})"
 
 
 class OutboxService:
-    """Протокол claim/ack.
+    """Выдача сообщений клиенту и подтверждение доставки."""
 
-    На каждом claim сервер сначала переносит наступившие напоминания в outbox, поэтому
-    отдельный планировщик не нужен. Точность напоминаний равна интервалу опроса клиента.
-    """
-
-    def __init__(self, session: AsyncSession, config: OutboxConfig, clock: Clock = utc_now) -> None:
+    def __init__(self, session: AsyncSession, *, settings: Settings) -> None:
         self._session = session
-        self._config = config
-        self._clock = clock
-        self._outbox = OutboxRepository(session)
-        self._tasks = TaskRepository(session)
+        self._batch_size = settings.outbox_batch_size
+        self._claim_timeout = timedelta(seconds=settings.outbox_claim_timeout_seconds)
+        self._max_attempts = settings.outbox_max_attempts
 
-    async def claim(self) -> list[OutboxItemOut]:
-        """Запланировать наступившие напоминания и выдать пачку сообщений."""
-        now = self._clock()
-        try:
-            scheduled = await self._schedule_due_reminders(now)
-            items = await self._outbox.claim(
-                now=now,
-                limit=self._config.batch_size,
-                stale_before=now - self._config.claim_timeout,
-                max_attempts=self._config.max_attempts,
+    async def claim(self) -> OutboxClaimResponse:
+        """Создать напоминания по наступившим задачам и отдать пачку сообщений."""
+        now = datetime.now(UTC)
+        await self._schedule_due_reminders(now)
+
+        stale_before = now - self._claim_timeout
+        stmt = (
+            select(OutboxMessage)
+            .where(OutboxMessage.attempts < self._max_attempts)
+            .where(
+                or_(
+                    OutboxMessage.status == OutboxStatus.PENDING,
+                    and_(
+                        OutboxMessage.status == OutboxStatus.CLAIMED,
+                        OutboxMessage.claimed_at < stale_before,
+                    ),
+                )
             )
-            result = [OutboxItemOut.model_validate(item) for item in items]
-            await self._session.commit()
-        except Exception:
-            await self._session.rollback()
-            raise
-        if scheduled or result:
-            logger.info("Outbox claim: reminders_scheduled=%s items=%s", scheduled, len(result))
-        return result
+            .order_by(OutboxMessage.id)
+            .limit(self._batch_size)
+        )
+        rows = list((await self._session.scalars(stmt)).all())
+        for row in rows:
+            row.status = OutboxStatus.CLAIMED
+            row.claimed_at = now
+            row.attempts += 1
+        await self._session.commit()
 
-    async def ack(self, request: OutboxAckRequest) -> int:
-        """Применить результаты доставки. Возвращает число обновлённых записей."""
-        now = self._clock()
+        return OutboxClaimResponse(
+            items=[OutboxItemOut.model_validate(row) for row in rows]
+        )
+
+    async def ack(self, request: OutboxAckRequest) -> OutboxAckResponse:
+        """Записать результаты доставки."""
+        now = datetime.now(UTC)
         updated = 0
-        try:
-            for item in request.items:
-                if await self._outbox.ack(
-                    item_id=item.id,
-                    status=item.status,
-                    error=item.error,
-                    now=now,
-                    max_attempts=self._config.max_attempts,
-                ):
-                    updated += 1
-            await self._session.commit()
-        except Exception:
-            await self._session.rollback()
-            raise
-        return updated
-
-    async def _schedule_due_reminders(self, now: datetime) -> int:
-        """Перенести наступившие напоминания в outbox.
-
-        Если у пользователя напоминания выключены, задача помечается напомненной
-        без отправки, чтобы после включения не пришла пачка старых уведомлений.
-        """
-        due = await self._tasks.due_reminders(now=now, limit=self._config.batch_size)
-        enqueued = 0
-        for reminder in due:
-            reminder.task.reminded_at = now
-            if not reminder.reminders_enabled:
+        for item in request.items:
+            row = await self._session.get(OutboxMessage, item.id)
+            if row is None or row.status != OutboxStatus.CLAIMED:
                 continue
-            await self._outbox.enqueue(
-                chat_id=reminder.chat_id,
-                kind=OutboxKind.REMINDER,
-                text=texts.REMINDER_MESSAGE.format(title=reminder.task.title, task_id=reminder.task.id),
-                now=now,
+            if item.status == AckStatus.SENT:
+                row.status = OutboxStatus.SENT
+                row.sent_at = now
+                row.last_error = None
+            else:
+                row.last_error = item.error
+                row.status = (
+                    OutboxStatus.FAILED
+                    if row.attempts >= self._max_attempts
+                    else OutboxStatus.PENDING
+                )
+            updated += 1
+        await self._session.commit()
+        return OutboxAckResponse(updated=updated)
+
+    async def _schedule_due_reminders(self, now: datetime) -> None:
+        """Переносит наступившие напоминания в outbox. Выключенные помечаются без отправки."""
+        stmt = (
+            select(Task, User.chat_id, UserSettings.reminders_enabled)
+            .join(User, User.id == Task.user_id)
+            .join(UserSettings, UserSettings.user_id == Task.user_id)
+            .where(
+                Task.remind_at.is_not(None),
+                Task.reminded_at.is_(None),
+                Task.is_done.is_(False),
+                Task.remind_at <= now,
             )
-            enqueued += 1
-        return enqueued
+            .limit(self._batch_size)
+        )
+        rows = (await self._session.execute(stmt)).all()
+        for task, chat_id, reminders_enabled in rows:
+            task.reminded_at = now
+            if not reminders_enabled:
+                continue
+            self._session.add(
+                OutboxMessage(
+                    chat_id=chat_id,
+                    user_id=task.user_id,
+                    task_id=task.id,
+                    kind=OutboxKind.REMINDER,
+                    text=REMINDER_TEXT.format(title=task.title, task_id=task.id),
+                    status=OutboxStatus.PENDING,
+                    attempts=0,
+                    created_at=now,
+                )
+            )
+        await self._session.flush()
