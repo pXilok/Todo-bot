@@ -95,7 +95,7 @@ class EventService:
 
         await repos.messages.add(
             user_id=user.id,
-            direction=MessageDirection.IN,
+            direction=MessageDirection.INCOMING,
             text=event.text,
             callback_data=event.callback_data,
             now=now,
@@ -118,7 +118,7 @@ class EventService:
             if (text := _outgoing_text(action)) is not None:
                 await repos.messages.add(
                     user_id=user.id,
-                    direction=MessageDirection.OUT,
+                    direction=MessageDirection.OUTGOING,
                     text=text,
                     callback_data=None,
                     now=now,
