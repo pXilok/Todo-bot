@@ -1,0 +1,27 @@
+services:
+  server:
+    build:
+      context: ./server
+    env_file:
+      - ./server/.env
+    environment:
+      DATABASE_URL: sqlite+aiosqlite:////app/data/bot.db
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - server-data:/app/data
+    restart: unless-stopped
+
+  bot:
+    build:
+      context: ./bot
+    env_file:
+      - ./bot/.env
+    environment:
+      SERVER_URL: http://server:8000
+    depends_on:
+      - server
+    restart: unless-stopped
+
+volumes:
+  server-data:
