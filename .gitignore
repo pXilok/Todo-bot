@@ -3,4 +3,4 @@ __pycache__/
 *.pyc
 server/data/*
 !server/data/.gitkeep
-.env
+.env.idea/
